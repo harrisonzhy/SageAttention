@@ -48,6 +48,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       const at::Tensor k,
                       const at::Tensor v,
                       const at::Tensor delta_s,
+                      const c10::optional<at::Tensor> mu,
                       at::Tensor out,
                       const at::Tensor sfq,
                       const at::Tensor sfk,
@@ -86,6 +87,15 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.ds_row_stride = delta_s.stride(-2);
     params.ds_head_stride = delta_s.stride(-3);
+    // V-Smooth: the values are tile-mean residuals and the kernel adds the
+    // means back weighted by each row's probability mass per tile.
+    params.v_smooth = mu.has_value();
+    if (mu.has_value()) {
+        params.mu_ptr = mu->data_ptr();
+        params.mu_tile_stride = mu->stride(-2);
+        params.mu_head_stride = mu->stride(-3);
+        params.mu_batch_stride = mu->stride(0);
+    }
     
     params.sfq_row_stride = sfq.stride(-2);
     params.sfk_row_stride = sfk.stride(-2);
@@ -208,6 +218,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
         const at::Tensor &sfk,
         const at::Tensor &sfv,
         const at::Tensor &delta_s,
+        c10::optional<at::Tensor> &mu,       // batch_size x num_heads_k x (seqlen_k / 128) x head_size, fp32
         int unpadded_k,
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         const float softmax_scale,
@@ -237,6 +248,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(delta_s.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    if (mu.has_value()) {
+        TORCH_CHECK(mu->dtype() == torch::kFloat32, "mu dtype must be float32");
+        CHECK_DEVICE(mu.value());
+        TORCH_CHECK(mu->stride(-1) == 1, "Input tensor must have contiguous last dimension");
+        TORCH_CHECK(!is_causal, "V-Smooth permutes the keys and has no causal mask");
+    }
 
     TORCH_CHECK(q.is_contiguous(), "Input tensor must be contiguous");
     TORCH_CHECK(k.is_contiguous(), "Input tensor must be contiguous");
@@ -262,6 +279,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     CHECK_SHAPE(q, batch_size, num_heads, seqlen_q, head_size_og);
     CHECK_SHAPE(k, batch_size, num_heads_k, seqlen_k, head_size_og);
     CHECK_SHAPE(v, batch_size, num_heads_k, unpacked_head_size, seqlen_k/2);
+    if (mu.has_value()) { CHECK_SHAPE(mu.value(), batch_size, num_heads_k, seqlen_k / 128, unpacked_head_size); }
     // CHECK_SHAPE(delta_s, batch_size, num_heads, seqlen_q / 128, seqlen_k);
     // CHECK_SHAPE(sfq, batch_size, seqlen_q, num_heads, unpacked_head_size);
     // CHECK_SHAPE(sfk, batch_size, seqlen_k, num_heads_k, unpacked_head_size);
@@ -293,7 +311,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
                      unpacked_head_size, unpacked_head_size,
-                     q, k, v, delta_s, out, 
+                     q, k, v, delta_s, mu, out,
                      sfq, sfk, sfv,
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,

@@ -40,6 +40,7 @@ template <
     typename SmemLayoutK,
     typename SmemLayoutV,
     typename SmemLayoutDS,
+    typename SmemLayoutMu,
     typename SmemLayoutO,
     typename SmemLayoutSFQ,
     typename SmemLayoutSFK,
@@ -53,6 +54,7 @@ struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0>{
     cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFK>> smem_SFK;
     cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFV>> smem_SFV;
     alignas(1024) cute::ArrayEngine<float, cute::cosize_v<SmemLayoutDS>> smem_ds;
+    alignas(128) cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMu>> smem_mu;
     alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutV>> smem_v;
     alignas(1024) cute::ArrayEngine<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
     
@@ -72,6 +74,7 @@ template <
     int kStages_,  
     int kClusterM_, 
     bool BlockMean_,
+    bool VSmooth_,
     typename ElementPairType_ = cutlass::nv_float4_t<cutlass::float_e2m1_t>, 
     typename ElementOut_ = cutlass::bfloat16_t
 >
@@ -80,6 +83,9 @@ struct Flash_fwd_kernel_traits {
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
     static constexpr bool BlockMean = BlockMean_;
+    // V-Smooth (VC-Attention): V holds per-128-key-tile mean residuals and the
+    // kernel adds each tile's mean weighted by the row's probability mass.
+    static constexpr bool VSmooth = VSmooth_;
     static constexpr bool SmoothQ = true;
     static_assert(kHeadDim % 32 == 0);
     static_assert(kBlockM == 64 || kBlockM == 128);
@@ -145,6 +151,8 @@ struct Flash_fwd_kernel_traits {
         decltype(tile_to_shape(SmemLayoutAtomDS{},
             make_shape(shape<0>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{})));
 
+    // One tile mean per V stage: (d, 1) per tile, loaded with V.
+    using SmemLayoutMu = Layout<Shape<Int<kHeadDim>, _1, Int<kStages>>>;
     using SmemCopyAtomQ = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomKV = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
@@ -190,7 +198,7 @@ struct Flash_fwd_kernel_traits {
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{}), Step<_1, _2>{}));
     using SharedStorage = SharedStorageQKVOwithSF<kStages, EpiStages, Element, ElementSF, ElementOut,
-        SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutDS, 
+        SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutDS, SmemLayoutMu,
         SmemLayoutO, SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFVt>;
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
     using PipelineState = typename cutlass::PipelineState<kStages>;

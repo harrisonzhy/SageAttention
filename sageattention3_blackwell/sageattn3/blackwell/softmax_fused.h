@@ -24,11 +24,14 @@ namespace flash {
 
 using namespace cute;
 
-template <int Rows>
+template <int Rows, bool VSmooth = false>
 struct SoftmaxFused{
 
     using TensorT = decltype(make_fragment_like<float>(Shape<Int<Rows>>{}));
     TensorT row_sum, row_max, scores_scale;
+    // V-Smooth: this tile's probability mass of each row, summed over the quad,
+    // in the units of row_sum; it weights the tile mean added to the output.
+    TensorT tile_sum;
     static constexpr float fp8_scalexfp4_scale = 1.f / (448 * 6);
     static constexpr float fp8_scalexfp4_scale_log2 = -11.392317422778762f; //log2f(fp8_scalexfp4_scale)
     static constexpr float fp4_scale_log2 = -2.584962500721156f; // log2f(fp4_scale)
@@ -128,11 +131,42 @@ struct SoftmaxFused{
                 // scores_scale(mi) = max_scaled;
             }
         }
+        if constexpr (VSmooth) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < size<0>(acc_reduction_view); mi++) {
+                float sum = 0.f;
+                CUTLASS_PRAGMA_UNROLL
+                for (int ni = 0; ni < size<1>(acc_reduction_view); ni++) {
+                    sum += acc_reduction_view(mi, ni);
+                }
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 1; i < RowReductionThr; i <<= 1) {
+                    sum += __shfl_xor_sync(int32_t(-1), sum, i);
+                }
+                tile_sum(mi) = sum;
+            }
+        }
+
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(AbsMaxP); ++i) {
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < size<0>(acc_conversion_flatten); ++j)
                 acc_conversion_flatten(j, i) /= AbsMaxP(i);
+        }
+    }
+
+    /// V-Smooth: add this tile's mean, weighted by the row's tile mass, to the
+    /// tile's output accumulator. ``o_coord`` maps the accumulator to (row, d).
+    template<typename TensorAcc, typename TensorCoord, typename TensorMu>
+    CUTLASS_DEVICE void add_tile_mean(TensorAcc& o_tmp, TensorCoord const& o_coord, TensorMu const& mu) {
+        Tensor o_tmp_reduction_view = make_tensor(o_tmp.data(), flash::convert_to_reduction_layout(o_tmp.layout()));
+        Tensor o_coord_reduction_view = make_tensor(o_coord.data(), flash::convert_to_reduction_layout(o_coord.layout()));
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < size(row_max); ++mi) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int ni = 0; ni < size<1>(o_tmp_reduction_view); ++ni) {
+                o_tmp_reduction_view(mi, ni) += tile_sum(mi) * mu(get<1>(o_coord_reduction_view(mi, ni)));
+            }
         }
     }
 

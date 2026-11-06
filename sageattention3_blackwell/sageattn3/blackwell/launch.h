@@ -61,6 +61,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             static_cast<float const*>(params.delta_s_ptr),
             {params.seqlen_s, params.seqlen_k, params.h_k, params.b},
             {params.ds_row_stride, _1{}, params.ds_head_stride, params.ds_batch_stride},
+            // Without V-Smooth the (unused) descriptor is built on one row of delta_s.
+            static_cast<float const*>(Kernel_traits::VSmooth ? params.mu_ptr : params.delta_s_ptr),
+            Kernel_traits::VSmooth
+                ? typename CollectiveMainloop::ShapeQKV{params.d, params.seqlen_k / Kernel_traits::kBlockN, params.h_k, params.b}
+                : typename CollectiveMainloop::ShapeQKV{params.d, 1, 1, 1},  // shape_Mu
+            Kernel_traits::VSmooth
+                ? typename CollectiveMainloop::StrideMu{_1{}, params.mu_tile_stride, params.mu_head_stride, params.mu_batch_stride}
+                : typename CollectiveMainloop::StrideMu{_1{}, params.d, params.d, params.d},  // stride_Mu
             params.scale_softmax_log2
         });
     typename CollectiveEpilogue::Params epilogue_params =
@@ -100,14 +108,16 @@ template<typename T, int Headdim, typename O = cutlass::bfloat16_t>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         BOOL_SWITCH(params.per_block_mean, per_block, [&] {
-            if constexpr (Headdim == 64 || Headdim == 128) {
-                run_flash_fwd<
-                    Flash_fwd_kernel_traits<Headdim, 128, 128, 3, 1, per_block, T, O>,
-                    Is_causal
-                >(params, stream);
-            } else {
-                static_assert(Headdim == 64 || Headdim == 128, "Unsupported Headdim");
-            }
+            BOOL_SWITCH(params.v_smooth, v_smooth, [&] {
+                if constexpr (Headdim == 64 || Headdim == 128) {
+                    run_flash_fwd<
+                        Flash_fwd_kernel_traits<Headdim, 128, 128, 3, 1, per_block, v_smooth, T, O>,
+                        Is_causal
+                    >(params, stream);
+                } else {
+                    static_assert(Headdim == 64 || Headdim == 128, "Unsupported Headdim");
+                }
+            });
         });
     });
 }

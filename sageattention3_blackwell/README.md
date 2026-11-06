@@ -43,6 +43,15 @@ attn_output = sageattn3_blackwell(q, k, v, is_causal=False)
 + `q, k, v` are **FP16/BF16** dtype with the shape `(batch_size, head_num, seq_len, head_dim)` 
 + `is_causal` determines the use of a causal mask.
 
+### VC-Attention V-Smooth
+The 4-bit VC-Attention configuration ([arXiv 2609.15810](https://arxiv.org/abs/2609.15810), Table 2) adds V-Smooth to this kernel: keys and values are read in a value-grouping order, the values are stored as NVFP4 residuals around their 128-token tile means and the kernel adds each tile's mean back weighted by the row's probability mass.
+```python
+from sageattn3 import sageattn3_blackwell_vsmooth, token_permutation
+perm = token_permutation(v)   # k-means grouping of the value rows, (batch_size, head_num, seq_len)
+attn_output = sageattn3_blackwell_vsmooth(q, k, v, perm)
+```
++ The grouping is computed on the first denoising steps of a generation and reused afterwards, as the paper does; no causal mask. `bench/bench_sage3_vsmooth.py` checks both kernels against fp32 attention and times them.
+
 ## Performance
 ### Speed of Kernels
 ![Speed on RTX5090](../assets/sage3_speed.png)

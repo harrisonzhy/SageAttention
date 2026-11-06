@@ -45,12 +45,14 @@ struct CollectiveMainloopFwd {
     static constexpr int kStages = Ktraits::kStages;
     static constexpr int kHeadDim = Ktraits::kHeadDim;
     static constexpr int BlockMean = Ktraits::BlockMean;
+    static constexpr bool VSmooth = Ktraits::VSmooth;
     using GmemTiledCopy = typename Ktraits::GmemTiledCopy;
     using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
     using SmemLayoutK = typename Ktraits::SmemLayoutK;
     using SmemLayoutV = typename Ktraits::SmemLayoutV;
     using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
     using SmemLayoutDS = typename Ktraits::SmemLayoutDS;
+    using SmemLayoutMu = typename Ktraits::SmemLayoutMu;
     using SmemLayoutAtomDS = typename Ktraits::SmemLayoutAtomDS;
     using LayoutDS = decltype(
         blocked_product(
@@ -63,6 +65,7 @@ struct CollectiveMainloopFwd {
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using ShapeSF = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d // 16, head, batch)
+    using StrideMu = cute::Stride<_1, int64_t, int64_t, int64_t>;  // (d, k_tile, head, batch)
     using LayoutSF = typename Ktraits::LayoutSF;
     using LayoutP = typename Ktraits::LayoutP;
     using LayoutSFP = typename Ktraits::LayoutSFP;
@@ -93,6 +96,12 @@ struct CollectiveMainloopFwd {
         make_tensor(make_gmem_ptr(static_cast<float const*>(nullptr)), LayoutDS{}),
         take<0, 2>(SmemLayoutDS{}),
         make_shape(shape<0>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
+        _1{}));
+    using TMA_Mu = decltype(make_tma_copy(
+        GmemTiledCopy{},
+        make_tensor(make_gmem_ptr(static_cast<float const*>(nullptr)), repeat_like(StrideMu{}, int32_t(0)), StrideMu{}),
+        take<0, 2>(SmemLayoutMu{}),
+        make_shape(shape<2>(TileShape_MNK{}), _1{}),
         _1{}));
     
     using BlkScaledConfig = typename Ktraits::BlkScaledConfig;
@@ -150,6 +159,7 @@ struct CollectiveMainloopFwd {
     
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(
         cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutSFVt{})) * cute::sizeof_bits_v<ElementSF>) +
+        (VSmooth ? cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutMu{})) * cute::sizeof_bits_v<float>) : 0) +
         cutlass::bits_to_bytes(size(take<0,2>(SmemLayoutVt{})) * sizeof_bits<Element>::value));
 
     // Host side kernel arguments
@@ -173,6 +183,9 @@ struct CollectiveMainloopFwd {
         float const* ptr_ds;
         ShapeQKV const shape_ds;
         StrideQKV const stride_ds;
+        float const* ptr_mu;
+        ShapeQKV const shape_mu;
+        StrideMu const stride_mu;
         float const softmax_scale_log2;
     };
 
@@ -186,6 +199,7 @@ struct CollectiveMainloopFwd {
         ShapeQKV const shape_Vt;
         LayoutSF const layout_SFVt;
         LayoutDS const layout_DS;
+        ShapeQKV const shape_mu;
         TMA_Q tma_load_Q;
         TMA_SFQ tma_load_SFQ;
         TMA_KV tma_load_K;
@@ -193,6 +207,7 @@ struct CollectiveMainloopFwd {
         TMA_Vt tma_load_Vt;
         TMA_SFVt tma_load_SFVt;
         TMA_DS tma_load_DS;
+        TMA_Mu tma_load_Mu;
         float const softmax_scale_log2;
     };
 
@@ -229,6 +244,13 @@ struct CollectiveMainloopFwd {
             SmemLayoutDS{}(_, _, _0{}),
             make_shape(shape<0>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
             _1{});
+        Tensor mMu = make_tensor(make_gmem_ptr(args.ptr_mu), args.shape_mu, args.stride_mu);
+        TMA_Mu tma_load_mu = make_tma_copy(
+            GmemTiledCopy{},
+            mMu,
+            SmemLayoutMu{}(_, _, _0{}),
+            make_shape(shape<2>(TileShape_MNK{}), _1{}),
+            _1{});
         LayoutSF layout_sfq = BlkScaledConfig::tile_atom_to_shape_SFQKV(args.shape_SFQ);
         Tensor mSFQ = make_tensor(make_gmem_ptr(args.ptr_SFQ), layout_sfq);
         TMA_SFQ tma_load_sfq = make_tma_copy<uint16_t>(
@@ -257,10 +279,12 @@ struct CollectiveMainloopFwd {
                 args.shape_K, args.unpadded_shape_K, layout_sfk,
                 args.shape_Vt, layout_sfvt,
                 layout_ds,
+                args.shape_mu,
                 tma_load_Q, tma_load_sfq,
                 tma_load_K, tma_load_sfk,
                 tma_load_Vt, tma_load_sfvt,
-                tma_load_ds, 
+                tma_load_ds,
+                tma_load_mu,
                 args.softmax_scale_log2};
     }
 
@@ -274,6 +298,9 @@ struct CollectiveMainloopFwd {
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_SFK.get_tma_descriptor());
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_SFVt.get_tma_descriptor());
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_DS.get_tma_descriptor());
+        if constexpr (VSmooth) {
+            cute::prefetch_tma_descriptor(mainloop_params.tma_load_Mu.get_tma_descriptor());
+        }
     }
 
     CUTLASS_DEVICE
@@ -459,11 +486,13 @@ struct CollectiveMainloopFwd {
         Tensor sSFK = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), SmemLayoutSFK{});
         Tensor sSFVt = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFVt{});
         Tensor sDS = make_tensor(make_smem_ptr(shared_storage.smem_ds.begin()), SmemLayoutDS{});
+        Tensor sMu = make_tensor(make_smem_ptr(shared_storage.smem_mu.begin()), SmemLayoutMu{});
 
         Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.shape_Q);
         Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.shape_K);
         Tensor mVt = mainloop_params.tma_load_Vt.get_tma_tensor(mainloop_params.shape_Vt);
         Tensor mDS = mainloop_params.tma_load_DS.get_tma_tensor(shape(mainloop_params.layout_DS));
+        Tensor mMu = mainloop_params.tma_load_Mu.get_tma_tensor(mainloop_params.shape_mu);
         Tensor mSFQ = mainloop_params.tma_load_SFQ.get_tma_tensor(shape(mainloop_params.layout_SFQ));
         Tensor mSFK = mainloop_params.tma_load_SFK.get_tma_tensor(shape(mainloop_params.layout_SFK));
         Tensor mSFVt = mainloop_params.tma_load_SFVt.get_tma_tensor(shape(mainloop_params.layout_SFVt));
@@ -480,6 +509,7 @@ struct CollectiveMainloopFwd {
                             return local_tile(mDS(_, _, bidh, bidb), select<0, 1>(TileShape_MNK{}), make_coord(_0{}, _));
                         }
                     }();
+        Tensor gMu = local_tile(mMu(_, _, bidh, bidb), make_shape(shape<2>(TileShape_MNK{}), _1{}), make_coord(_0{}, _));  // (D, 1, _)
         Tensor gSFQ = local_tile(mSFQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
         Tensor gSFK = local_tile(mSFK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
         Tensor gSFVt = local_tile(mSFVt(_, _, bidh, bidb), make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), make_coord(_0{}, _));
@@ -504,6 +534,9 @@ struct CollectiveMainloopFwd {
         auto block_tma_ds = mainloop_params.tma_load_DS.get_slice(cluster_local_block_id.x);
         Tensor tDSgDS = group_modes<0, 3>(block_tma_ds.partition_S(gDS));
         Tensor tDSsDS = group_modes<0, 3>(block_tma_ds.partition_D(sDS));
+        auto block_tma_mu = mainloop_params.tma_load_Mu.get_slice(cluster_local_block_id.x);
+        Tensor tMugMu = group_modes<0, 3>(block_tma_mu.partition_S(gMu));
+        Tensor tMusMu = group_modes<0, 3>(block_tma_mu.partition_D(sMu));
         uint16_t mcast_mask_kv = 0;
 
         int n_block = n_block_max - 1;
@@ -526,6 +559,10 @@ struct CollectiveMainloopFwd {
             tVgVt(_, n_block), tVsVt(_, smem_pipe_write_v.index()));
         copy(mainloop_params.tma_load_SFVt.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
             tVgSFVt(_, n_block), tVsSFVt(_, smem_pipe_write_v.index()));
+        if constexpr (VSmooth) {
+            copy(mainloop_params.tma_load_Mu.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+                tMugMu(_, n_block), tMusMu(_, smem_pipe_write_v.index()));
+        }
         ++smem_pipe_write_v;
         }
 
@@ -547,6 +584,10 @@ struct CollectiveMainloopFwd {
                     tVgVt(_, n_block), tVsVt(_, smem_pipe_write_v.index()));
                 copy(mainloop_params.tma_load_SFVt.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
                     tVgSFVt(_, n_block), tVsSFVt(_, smem_pipe_write_v.index()));
+                if constexpr (VSmooth) {
+                    copy(mainloop_params.tma_load_Mu.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+                        tMugMu(_, n_block), tMusMu(_, smem_pipe_write_v.index()));
+                }
                 ++smem_pipe_write_v;
             }
         }
@@ -600,6 +641,7 @@ struct CollectiveMainloopFwd {
         Tensor sSFQ = make_tensor(make_smem_ptr(shared_storage.smem_SFQ.begin()), SmemLayoutSFQ{});
         Tensor sSFK = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), SmemLayoutSFK{});
         Tensor sSFVt = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFVt{});
+        Tensor sMu = make_tensor(make_smem_ptr(shared_storage.smem_mu.begin()), SmemLayoutMu{});
 
         Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
         Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
@@ -688,6 +730,17 @@ struct CollectiveMainloopFwd {
         // auto gemm_pv = [&](auto block_id) {
         //     cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, block_id), tOrSFP(_, _, block_id)), make_zip_tensor(tOrVt(_, _, block_id), tOrSFVt(_, _, block_id)), tOrO);
         // };
+        // V-Smooth: the output tile accumulator gets this tile's mean weighted
+        // by each row's tile mass, before the V stage that holds the mean is
+        // released. The scales of P and V apply inside the MMA, so the mean is
+        // added unscaled in the units of the row sum.
+        Tensor cO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
+        Tensor tOcO = thread_mma_pv.partition_C(cO);
+        auto add_means = [&](auto& acc) {
+            if constexpr (VSmooth) {
+                softmax_fused.add_tile_mean(acc, tOcO, sMu(_, _0{}, smem_pipe_read_v.index()));
+            }
+        };
         auto add_delta_s = [&](auto& acc) {
             auto tSsDS_stage = recast<float4>(sDS(_, _, smem_pipe_read_k.index()));
             auto acc_float4 = recast<float4>(acc);
@@ -809,6 +862,7 @@ struct CollectiveMainloopFwd {
                 copy_v_block(v_block + 1);
                 quantize(v_block + 1, tSrS_converion_view);
             } else {
+                add_means(tOrO_store);
                 pipeline_v.consumer_release(smem_pipe_read_v);
                 ++smem_pipe_read_v;
             }
@@ -856,6 +910,7 @@ struct CollectiveMainloopFwd {
                     quantize(v_block + 1, tSrS_converion_view);
                 }
             }
+            add_means(tOrO);
             pipeline_v.consumer_release(smem_pipe_read_v);
             ++smem_pipe_read_v;
             if (masking_step > 0) { softmax_fused.rescale_o(tOrO_store, tOrO); }
@@ -892,6 +947,7 @@ struct CollectiveMainloopFwd {
                     copy_v_block(v_block + 1);
                     quantize(v_block + 1, tSrS_converion_view);
                 } else {
+                    add_means(tOrO);
                     pipeline_v.consumer_release(smem_pipe_read_v);
                     ++smem_pipe_read_v;
                 }
